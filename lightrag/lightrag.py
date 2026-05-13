@@ -750,7 +750,12 @@ class LightRAG:
     ollama_server_infos: Optional[OllamaServerInfos] = field(default=None)
     """Configuration for Ollama server information."""
 
+    user_id: Optional[str] = field(default=None)
+    """User ID for loading user-specific prompt configurations from database."""
+
     _storages_status: StoragesStatus = field(default=StoragesStatus.NOT_CREATED)
+    _prompt_storage: Optional[Any] = field(default=None, init=False, repr=False)
+    """Internal prompt storage service instance."""
 
     @staticmethod
     def _normalize_llm_role(role: str) -> str:
@@ -1054,6 +1059,30 @@ class LightRAG:
             )
         self.embedding_token_limit = embedding_max_token_size
 
+        # Initialize prompt storage and load user prompts if enabled
+        if os.getenv("PROMPT_STORAGE_ENABLED", "false").lower() == "true" and self.user_id:
+            try:
+                from lightrag.prompt_storage import PromptStorageService
+
+                # Build connection string from environment variables
+                db_host = os.getenv("POSTGRES_HOST", "localhost")
+                db_port = os.getenv("POSTGRES_PORT", "5432")
+                db_name = os.getenv("POSTGRES_DB", "lightrag")
+                db_user = os.getenv("POSTGRES_USER", "postgres")
+                db_password = os.getenv("POSTGRES_PASSWORD", "")
+
+                connection_string = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+
+                self._prompt_storage = PromptStorageService(connection_string)
+
+                # Load user prompts asynchronously (will be done in initialize_storages)
+                logger.info(f"Prompt storage enabled for user: {self.user_id}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize prompt storage: {e}")
+                self._prompt_storage = None
+        else:
+            self._prompt_storage = None
+
         # Fix global_config now
         global_config = asdict(self)
         # Restore original EmbeddingFunc object (asdict converts it to dict)
@@ -1195,6 +1224,27 @@ class LightRAG:
     async def initialize_storages(self):
         """Storage initialization must be called one by one to prevent deadlock"""
         if self._storages_status == StoragesStatus.CREATED:
+            # Initialize prompt storage and load user prompts if enabled
+            if self._prompt_storage:
+                try:
+                    await self._prompt_storage.initialize()
+                    user_prompts = await self._prompt_storage.get_user_prompts(self.user_id)
+
+                    # Merge user prompts with system prompts (user prompts take precedence)
+                    from lightrag.prompt import PROMPTS
+                    merged_prompts = PROMPTS.copy()
+                    merged_prompts.update(user_prompts)
+
+                    # Update global_config with merged prompts
+                    # This ensures all operations use the user's custom prompts
+                    for key, value in merged_prompts.items():
+                        if key in PROMPTS:
+                            PROMPTS[key] = value
+
+                    logger.info(f"Loaded custom prompts for user: {self.user_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to load user prompts, using system defaults: {e}")
+
             # Set the first initialized workspace will set the default workspace
             # Allows namespace operation without specifying workspace for backward compatibility
             default_workspace = get_default_workspace()

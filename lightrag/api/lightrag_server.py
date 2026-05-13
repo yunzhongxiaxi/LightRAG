@@ -54,6 +54,7 @@ from lightrag.api.routers.document_routes import (
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.routers.prompt_routes import create_prompt_routes
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -354,6 +355,31 @@ def create_app(args):
         # Store background tasks
         app.state.background_tasks = set()
 
+        # Initialize prompt storage service if enabled
+        prompt_storage = None
+        if os.getenv("PROMPT_STORAGE_ENABLED", "false").lower() == "true":
+            try:
+                from lightrag.prompt_storage import PromptStorageService
+
+                # Build connection string from environment variables
+                db_host = os.getenv("POSTGRES_HOST", "localhost")
+                db_port = os.getenv("POSTGRES_PORT", "5432")
+                db_name = os.getenv("POSTGRES_DB", "lightrag")
+                db_user = os.getenv("POSTGRES_USER", "postgres")
+                db_password = os.getenv("POSTGRES_PASSWORD", "")
+
+                connection_string = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+
+                prompt_storage = PromptStorageService(connection_string)
+                await prompt_storage.initialize()
+                app.state.prompt_storage = prompt_storage
+                logger.info("Prompt storage service initialized")
+            except Exception as e:
+                logger.warning(f"Failed to initialize prompt storage: {e}")
+                app.state.prompt_storage = None
+        else:
+            app.state.prompt_storage = None
+
         try:
             # Initialize database connections
             # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
@@ -367,6 +393,10 @@ def create_app(args):
             yield
 
         finally:
+            # Clean up prompt storage
+            if prompt_storage:
+                await prompt_storage.close()
+
             # Clean up database connections
             await rag.finalize_storages()
 
@@ -1424,6 +1454,10 @@ def create_app(args):
     )
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
+
+    # Add Prompt Management routes (if enabled)
+    if app.state.prompt_storage:
+        app.include_router(create_prompt_routes(app.state.prompt_storage))
 
     # Add Ollama API routes
     ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
