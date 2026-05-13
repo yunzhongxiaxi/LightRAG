@@ -4685,6 +4685,11 @@ async def _build_query_context(
         query_embedding=search_result["query_embedding"],
     )
 
+    # Apply metadata filtering and sorting to merged chunks
+    if merged_chunks:
+        from lightrag.utils_metadata import apply_metadata_filter_and_sort
+        merged_chunks = apply_metadata_filter_and_sort(merged_chunks, query_param)
+
     if (
         not merged_chunks
         and not truncation_result["entities_context"]
@@ -5387,6 +5392,16 @@ async def naive_query(
     if chunks is None or len(chunks) == 0:
         logger.info(
             "[naive_query] No relevant document chunks found; returning no-result."
+        )
+        return None
+
+    # Apply metadata filtering and sorting
+    from lightrag.utils_metadata import apply_metadata_filter_and_sort
+    chunks = apply_metadata_filter_and_sort(chunks, query_param)
+
+    if len(chunks) == 0:
+        logger.info(
+            "[naive_query] All chunks filtered out by metadata filter; returning no-result."
         )
         return None
 
