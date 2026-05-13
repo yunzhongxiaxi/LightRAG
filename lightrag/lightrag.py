@@ -1680,6 +1680,7 @@ class LightRAG:
         ids: str | list[str] | None = None,
         file_paths: str | list[str] | None = None,
         track_id: str | None = None,
+        metadata: dict[str, Any] | list[dict[str, Any]] | None = None,
     ) -> str:
         """Async Insert documents with checkpoint support
 
@@ -1692,6 +1693,9 @@ class LightRAG:
             ids: list of unique document IDs, if not provided, MD5 hash IDs will be generated
             file_paths: list of file paths corresponding to each document, used for citation
             track_id: tracking ID for monitoring processing status, if not provided, will be generated
+            metadata: Optional metadata dict or list of metadata dicts (one per document).
+                     System automatically adds 'inserted_at' timestamp if not provided.
+                     Example: {"doc_type": "amendment", "status": "active", "priority": "high"}
 
         Returns:
             str: tracking ID for monitoring processing status
@@ -1700,7 +1704,7 @@ class LightRAG:
         if track_id is None:
             track_id = generate_track_id("insert")
 
-        await self.apipeline_enqueue_documents(input, ids, file_paths, track_id)
+        await self.apipeline_enqueue_documents(input, ids, file_paths, track_id, metadata)
         await self.apipeline_process_enqueue_documents(
             split_by_character, split_by_character_only
         )
@@ -1787,6 +1791,7 @@ class LightRAG:
         track_id: str | None = None,
         docs_format: str = FULL_DOCS_FORMAT_RAW,
         lightrag_document_paths: str | list[str] | None = None,
+        metadata: dict[str, Any] | list[dict[str, Any]] | None = None,
     ) -> str:
         """
         Pipeline for Processing Documents
@@ -1803,6 +1808,7 @@ class LightRAG:
             track_id: tracking ID for monitoring processing status
             docs_format: "raw" (default) or "lightrag"; when "lightrag" content may be empty and content-dedup is skipped
             lightrag_document_paths: paths to LightRAG Document (e.g. .blocks.jsonl dir or base path), when docs_format is lightrag
+            metadata: Optional metadata dict or list of metadata dicts (one per document)
 
         Returns:
             str: tracking ID for monitoring processing status
@@ -1820,6 +1826,28 @@ class LightRAG:
             lightrag_document_paths = (
                 [lightrag_document_paths] if lightrag_document_paths else None
             )
+
+        # Normalize metadata parameter
+        if metadata is not None:
+            if isinstance(metadata, dict):
+                # Single metadata dict for all documents
+                metadata = [metadata] * len(input)
+            elif isinstance(metadata, list):
+                if len(metadata) != len(input):
+                    raise ValueError(
+                        "Number of metadata dicts must match the number of documents"
+                    )
+            else:
+                raise ValueError("metadata must be a dict or list of dicts")
+        else:
+            # No metadata provided, use empty dicts
+            metadata = [{}] * len(input)
+
+        # Add automatic timestamp to each metadata dict
+        current_timestamp = datetime.now(timezone.utc).isoformat()
+        for meta in metadata:
+            if "inserted_at" not in meta:
+                meta["inserted_at"] = current_timestamp
 
         # If file_paths is provided, ensure it matches the number of documents
         if file_paths is not None:
@@ -1850,6 +1878,9 @@ class LightRAG:
             if len(ids) != len(set(ids)):
                 raise ValueError("IDs must be unique")
 
+        # Build metadata mapping: doc_id -> metadata
+        metadata_map = {}
+
         if is_lightrag_format:
             # LightRAG Document: no content hash dedup; content may be empty
             contents = {}
@@ -1870,13 +1901,14 @@ class LightRAG:
                     "format": FULL_DOCS_FORMAT_LIGHTRAG,
                     "lightrag_document_path": lightrag_path,
                 }
+                metadata_map[doc_id] = metadata[i]
         elif ids is not None:
             # Generate contents dict and remove duplicates in one pass
             unique_contents = {}
-            for id_, doc, path in zip(ids, input, file_paths):
+            for i, (id_, doc, path) in enumerate(zip(ids, input, file_paths)):
                 cleaned_content = sanitize_text_for_encoding(doc)
                 if cleaned_content not in unique_contents:
-                    unique_contents[cleaned_content] = (id_, path)
+                    unique_contents[cleaned_content] = (id_, path, i)
 
             contents = {
                 id_: {
@@ -1884,8 +1916,10 @@ class LightRAG:
                     "file_path": file_path,
                     "format": FULL_DOCS_FORMAT_RAW,
                 }
-                for content, (id_, file_path) in unique_contents.items()
+                for content, (id_, file_path, idx) in unique_contents.items()
             }
+            for content, (id_, file_path, idx) in unique_contents.items():
+                metadata_map[id_] = metadata[idx]
         elif docs_format == FULL_DOCS_FORMAT_PENDING_PARSE:
             contents = {}
             for i, (doc, path) in enumerate(zip(input, file_paths)):
@@ -1899,13 +1933,14 @@ class LightRAG:
                     "file_path": path,
                     "format": FULL_DOCS_FORMAT_PENDING_PARSE,
                 }
+                metadata_map[doc_id] = metadata[i]
         else:
             # Clean input text and remove duplicates in one pass
             unique_content_with_paths = {}
-            for doc, path in zip(input, file_paths):
+            for i, (doc, path) in enumerate(zip(input, file_paths)):
                 cleaned_content = sanitize_text_for_encoding(doc)
                 if cleaned_content not in unique_content_with_paths:
-                    unique_content_with_paths[cleaned_content] = path
+                    unique_content_with_paths[cleaned_content] = (path, i)
 
             contents = {
                 compute_mdhash_id(content, prefix="doc-"): {
@@ -1913,8 +1948,11 @@ class LightRAG:
                     "file_path": path,
                     "format": FULL_DOCS_FORMAT_RAW,
                 }
-                for content, path in unique_content_with_paths.items()
+                for content, (path, idx) in unique_content_with_paths.items()
             }
+            for content, (path, idx) in unique_content_with_paths.items():
+                doc_id = compute_mdhash_id(content, prefix="doc-")
+                metadata_map[doc_id] = metadata[idx]
 
         # 2. Generate document initial status (without content)
         new_docs: dict[str, Any] = {
@@ -1926,6 +1964,7 @@ class LightRAG:
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "file_path": content_data["file_path"],
                 "track_id": track_id,
+                "metadata": metadata_map.get(id_, {}),
             }
             for id_, content_data in contents.items()
         }

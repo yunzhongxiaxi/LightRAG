@@ -168,6 +168,24 @@ class QueryParam:
     containing citation information for the retrieved content.
     """
 
+    metadata_filter: Callable[[dict[str, Any]], bool] | None = None
+    """Optional filter function for metadata-based filtering of retrieved chunks.
+    Function receives chunk metadata dict and returns True to keep, False to filter out.
+    Example: lambda meta: meta.get("status") != "superseded"
+    """
+
+    metadata_sort_key: Callable[[dict[str, Any]], Any] | None = None
+    """Optional sort key function for metadata-based sorting of retrieved chunks.
+    Function receives chunk metadata dict and returns a comparable value for sorting.
+    Example: lambda meta: meta.get("inserted_at", "")
+    If None, defaults to sorting by inserted_at timestamp (newest first).
+    """
+
+    metadata_sort_reverse: bool = True
+    """Sort direction for metadata sorting. True = descending (newest first), False = ascending.
+    Only applies when metadata_sort_key is used or default timestamp sorting is active.
+    """
+
 
 @dataclass
 class StorageNameSpace(ABC):
