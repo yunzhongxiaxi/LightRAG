@@ -1,368 +1,330 @@
 """
-Prompt Storage Service for LightRAG
+Prompt Storage Service for LightRAG - Redesigned
 
-Provides PostgreSQL-based storage for prompt templates, versions, and user configurations.
+支持订阅机制、真实版本号、软删除的 Prompt 管理系统。
 """
 
 from __future__ import annotations
 from typing import Any, Optional, List, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import asyncpg
 from lightrag.utils import logger
 
 
 class PromptStorageService:
-    """Service for managing prompt templates and versions in PostgreSQL."""
+    """Prompt 存储服务，支持订阅机制和热更新"""
 
     def __init__(self, connection_string: str):
-        """Initialize the prompt storage service.
-
-        Args:
-            connection_string: PostgreSQL connection string
-        """
         self.connection_string = connection_string
         self.pool: Optional[asyncpg.Pool] = None
 
     async def initialize(self):
-        """Initialize database connection pool."""
+        """初始化数据库连接池"""
         self.pool = await asyncpg.create_pool(self.connection_string)
         logger.info("Prompt storage service initialized")
 
     async def close(self):
-        """Close database connection pool."""
+        """关闭数据库连接池"""
         if self.pool:
             await self.pool.close()
             logger.info("Prompt storage service closed")
 
     async def get_system_prompts(self) -> Dict[str, Any]:
-        """Get system default prompts.
-
-        Returns:
-            Dictionary of system prompts
-        """
+        """获取系统默认 Prompt"""
         from lightrag.prompt import PROMPTS
         return PROMPTS.copy()
 
     async def create_template(
         self,
-        name: str,
+        creator: str,
         content: Dict[str, str],
-        created_by: str,
-        description: Optional[str] = None,
-        is_template: bool = False,
-        template_type: str = "user"
     ) -> int:
-        """Create a new prompt template.
+        """创建新模板版本
 
         Args:
-            name: Template name
-            content: Prompt content as JSON
-            created_by: Username of creator
-            description: Optional description
-            is_template: Whether this is a reusable template
-            template_type: Type of template (system/user/shared)
+            creator: 创建者
+            content: Prompt 内容（部分自定义）
 
         Returns:
-            Template ID
+            新版本号（真实版本号）
         """
         async with self.pool.acquire() as conn:
-            template_id = await conn.fetchval(
+            # 获取该创建者的最大版本号
+            max_version = await conn.fetchval(
                 """
-                INSERT INTO prompt_templates (name, description, type, content, created_by, is_template)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id
+                SELECT MAX(version) FROM templates
+                WHERE creator = $1 AND is_deleted = false
                 """,
-                name, description, template_type, json.dumps(content), created_by, is_template
+                creator
             )
+            new_version = (max_version or 0) + 1
 
-            # Create initial version
+            # 插入新版本
             await conn.execute(
                 """
-                INSERT INTO prompt_versions (template_id, content, created_by, comment)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO templates (creator, version, content)
+                VALUES ($1, $2, $3)
                 """,
-                template_id, json.dumps(content), created_by, "Initial version"
+                creator, new_version, json.dumps(content)
             )
 
-            logger.info(f"Created prompt template: {name} (ID: {template_id})")
-            return template_id
+            logger.info(f"Created template for {creator}, version {new_version}")
+            return new_version
 
     async def update_template(
         self,
-        template_id: int,
+        creator: str,
+        version: int,
         content: Dict[str, str],
-        updated_by: str,
-        comment: Optional[str] = None
     ) -> int:
-        """Update a prompt template and create a new version.
+        """更新模板（实际是创建新版本）
 
         Args:
-            template_id: Template ID
-            content: New prompt content
-            updated_by: Username of updater
-            comment: Optional version comment
+            creator: 创建者
+            version: 要更新的版本号（真实版本号）
+            content: 新的 Prompt 内容
 
         Returns:
-            New version number
+            新版本号
         """
-        async with self.pool.acquire() as conn:
-            # Update template
-            await conn.execute(
-                """
-                UPDATE prompt_templates
-                SET content = $1, updated_at = NOW()
-                WHERE id = $2
-                """,
-                json.dumps(content), template_id
-            )
+        # 更新就是创建新版本
+        return await self.create_template(creator, content)
 
-            # Create new version
-            version = await conn.fetchval(
-                """
-                INSERT INTO prompt_versions (template_id, content, created_by, comment)
-                VALUES ($1, $2, $3, $4)
-                RETURNING version
-                """,
-                template_id, json.dumps(content), updated_by, comment or "Updated"
-            )
-
-            logger.info(f"Updated template {template_id} to version {version}")
-            return version
-
-    async def get_template(self, template_id: int) -> Optional[Dict[str, Any]]:
-        """Get a prompt template by ID.
+    async def get_template(
+        self,
+        creator: str,
+        version: int
+    ) -> Optional[Dict[str, Any]]:
+        """获取特定版本的模板
 
         Args:
-            template_id: Template ID
+            creator: 创建者
+            version: 版本号（真实版本号）
 
         Returns:
-            Template data or None if not found
+            模板数据或 None
         """
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, name, description, type, content, created_by,
-                       created_at, updated_at, is_template, is_active
-                FROM prompt_templates
-                WHERE id = $1
+                SELECT id, creator, version, content, is_deleted,
+                       created_at, updated_at
+                FROM templates
+                WHERE creator = $1 AND version = $2
                 """,
-                template_id
+                creator, version
             )
 
             if row:
                 return {
                     "id": row["id"],
-                    "name": row["name"],
-                    "description": row["description"],
-                    "type": row["type"],
+                    "creator": row["creator"],
+                    "version": row["version"],
                     "content": json.loads(row["content"]),
-                    "created_by": row["created_by"],
+                    "is_deleted": row["is_deleted"],
                     "created_at": row["created_at"].isoformat(),
                     "updated_at": row["updated_at"].isoformat(),
-                    "is_template": row["is_template"],
-                    "is_active": row["is_active"]
                 }
             return None
 
-    async def list_templates(
-        self,
-        template_type: Optional[str] = None,
-        is_active: bool = True
-    ) -> List[Dict[str, Any]]:
-        """List prompt templates.
-
-        Args:
-            template_type: Filter by type (system/user/shared)
-            is_active: Filter by active status
-
-        Returns:
-            List of templates
-        """
+    async def get_latest_template(self, creator: str) -> Optional[Dict[str, Any]]:
+        """获取创建者的最新版本模板"""
         async with self.pool.acquire() as conn:
-            query = """
-                SELECT id, name, description, type, created_by,
-                       created_at, updated_at, is_template
-                FROM prompt_templates
-                WHERE is_active = $1
-            """
-            params = [is_active]
+            row = await conn.fetchrow(
+                """
+                SELECT id, creator, version, content, is_deleted,
+                       created_at, updated_at
+                FROM templates
+                WHERE creator = $1 AND is_deleted = false
+                ORDER BY version DESC
+                LIMIT 1
+                """,
+                creator
+            )
 
-            if template_type:
-                query += " AND type = $2"
-                params.append(template_type)
-
-            query += " ORDER BY created_at DESC"
-
-            rows = await conn.fetch(query, *params)
-
-            return [
-                {
+            if row:
+                return {
                     "id": row["id"],
-                    "name": row["name"],
-                    "description": row["description"],
-                    "type": row["type"],
-                    "created_by": row["created_by"],
+                    "creator": row["creator"],
+                    "version": row["version"],
+                    "content": json.loads(row["content"]),
+                    "is_deleted": row["is_deleted"],
                     "created_at": row["created_at"].isoformat(),
                     "updated_at": row["updated_at"].isoformat(),
-                    "is_template": row["is_template"]
                 }
-                for row in rows
-            ]
+            return None
 
-    async def get_versions(self, template_id: int) -> List[Dict[str, Any]]:
-        """Get version history for a template.
-
-        Args:
-            template_id: Template ID
+    async def list_versions(self, creator: str) -> List[int]:
+        """列出创建者的所有版本号（真实版本号，未删除的）
 
         Returns:
-            List of versions
+            版本号列表，按版本号降序排列
         """
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, version, content, created_at, created_by, comment
-                FROM prompt_versions
-                WHERE template_id = $1
+                SELECT version FROM templates
+                WHERE creator = $1 AND is_deleted = false
                 ORDER BY version DESC
                 """,
-                template_id
+                creator
             )
+            return [row["version"] for row in rows]
 
-            return [
-                {
-                    "id": row["id"],
-                    "version": row["version"],
-                    "content": json.loads(row["content"]),
-                    "created_at": row["created_at"].isoformat(),
-                    "created_by": row["created_by"],
-                    "comment": row["comment"]
-                }
-                for row in rows
-            ]
+    async def soft_delete_template(self, creator: str, version: int):
+        """软删除模板版本"""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE templates
+                SET is_deleted = true, updated_at = NOW()
+                WHERE creator = $1 AND version = $2
+                """,
+                creator, version
+            )
+            logger.info(f"Soft deleted template {creator} v{version}")
 
-    async def rollback_to_version(
+    async def subscribe(
         self,
-        template_id: int,
-        version: int,
-        rolled_back_by: str
-    ) -> int:
-        """Rollback template to a specific version.
+        user_id: str,
+        creator: str,
+        version: Optional[int] = None,
+        is_auto_update: bool = True
+    ):
+        """订阅模板
 
         Args:
-            template_id: Template ID
-            version: Version number to rollback to
-            rolled_back_by: Username performing rollback
-
-        Returns:
-            New version number
+            user_id: 用户 ID
+            creator: 创建者
+            version: 订阅的版本号（None = 订阅最新版本）
+            is_auto_update: 是否自动更新
         """
         async with self.pool.acquire() as conn:
-            # Get content from target version
-            content = await conn.fetchval(
-                """
-                SELECT content
-                FROM prompt_versions
-                WHERE template_id = $1 AND version = $2
-                """,
-                template_id, version
-            )
-
-            if not content:
-                raise ValueError(f"Version {version} not found for template {template_id}")
-
-            # Update template and create new version
             await conn.execute(
                 """
-                UPDATE prompt_templates
-                SET content = $1, updated_at = NOW()
-                WHERE id = $2
-                """,
-                content, template_id
-            )
-
-            new_version = await conn.fetchval(
-                """
-                INSERT INTO prompt_versions (template_id, content, created_by, comment)
+                INSERT INTO user_template_subscriptions
+                    (user_id, creator, subscribed_version, is_auto_update)
                 VALUES ($1, $2, $3, $4)
-                RETURNING version
+                ON CONFLICT (user_id, creator)
+                DO UPDATE SET
+                    subscribed_version = $3,
+                    is_auto_update = $4,
+                    last_synced_at = NOW()
                 """,
-                template_id, content, rolled_back_by, f"Rolled back to version {version}"
+                user_id, creator, version, is_auto_update
             )
+            logger.info(f"User {user_id} subscribed to {creator} v{version or 'latest'}")
 
-            logger.info(f"Rolled back template {template_id} to version {version} (new version: {new_version})")
-            return new_version
-
-    async def set_user_config(self, user_id: str, template_id: int):
-        """Set active template for a user.
-
-        Args:
-            user_id: User ID
-            template_id: Template ID to activate
-        """
+    async def unsubscribe(self, user_id: str, creator: str):
+        """取消订阅"""
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO user_prompt_configs (user_id, template_id)
-                VALUES ($1, $2)
-                ON CONFLICT (user_id) DO UPDATE SET template_id = $2, updated_at = NOW()
+                DELETE FROM user_template_subscriptions
+                WHERE user_id = $1 AND creator = $2
                 """,
-                user_id, template_id
+                user_id, creator
             )
-            logger.info(f"Set template {template_id} for user {user_id}")
+            logger.info(f"User {user_id} unsubscribed from {creator}")
 
-    async def get_user_config(self, user_id: str) -> Optional[int]:
-        """Get active template ID for a user.
-
-        Args:
-            user_id: User ID
-
-        Returns:
-            Template ID or None if not configured
-        """
+    async def get_subscription(
+        self,
+        user_id: str,
+        creator: str
+    ) -> Optional[Dict[str, Any]]:
+        """获取订阅信息"""
         async with self.pool.acquire() as conn:
-            return await conn.fetchval(
+            row = await conn.fetchrow(
                 """
-                SELECT template_id
-                FROM user_prompt_configs
-                WHERE user_id = $1
+                SELECT user_id, creator, subscribed_version,
+                       is_auto_update, last_synced_at
+                FROM user_template_subscriptions
+                WHERE user_id = $1 AND creator = $2
                 """,
-                user_id
+                user_id, creator
             )
+
+            if row:
+                return {
+                    "user_id": row["user_id"],
+                    "creator": row["creator"],
+                    "subscribed_version": row["subscribed_version"],
+                    "is_auto_update": row["is_auto_update"],
+                    "last_synced_at": row["last_synced_at"].isoformat(),
+                }
+            return None
 
     async def get_user_prompts(self, user_id: str) -> Dict[str, Any]:
-        """Get prompts for a user (user config or system default).
+        """获取用户当前使用的 Prompt（合并系统 Prompt 和订阅的模板）
 
         Args:
-            user_id: User ID
+            user_id: 用户 ID
 
         Returns:
-            Dictionary of prompts
+            合并后的 Prompt 字典
         """
-        template_id = await self.get_user_config(user_id)
+        # 获取系统默认 Prompt
+        prompts = await self.get_system_prompts()
 
-        if template_id:
-            template = await self.get_template(template_id)
-            if template and template["is_active"]:
-                return template["content"]
+        # 查找用户订阅（默认订阅自己的模板）
+        subscription = await self.get_subscription(user_id, user_id)
 
-        # Fallback to system prompts
-        return await self.get_system_prompts()
+        if subscription:
+            # 获取订阅的模板
+            if subscription["subscribed_version"] is None:
+                # 订阅最新版本
+                template = await self.get_latest_template(subscription["creator"])
+            else:
+                # 订阅特定版本
+                template = await self.get_template(
+                    subscription["creator"],
+                    subscription["subscribed_version"]
+                )
 
-    async def delete_template(self, template_id: int):
-        """Soft delete a template.
+            if template and not template["is_deleted"]:
+                # 合并用户自定义 Prompt（用户配置覆盖系统默认）
+                prompts.update(template["content"])
 
-        Args:
-            template_id: Template ID
+        return prompts
+
+    async def check_for_updates(
+        self,
+        user_id: str,
+        creator: str
+    ) -> Optional[Dict[str, Any]]:
+        """检查订阅是否有更新
+
+        Returns:
+            如果有更新返回最新模板，否则返回 None
         """
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE prompt_templates
-                SET is_active = FALSE, updated_at = NOW()
-                WHERE id = $1
-                """,
-                template_id
-            )
-            logger.info(f"Deleted template {template_id}")
+        subscription = await self.get_subscription(user_id, creator)
+        if not subscription or not subscription["is_auto_update"]:
+            return None
+
+        if subscription["subscribed_version"] is not None:
+            # 订阅特定版本，不自动更新
+            return None
+
+        # 订阅最新版本，检查是否有更新
+        latest = await self.get_latest_template(creator)
+        if not latest:
+            return None
+
+        last_synced = datetime.fromisoformat(subscription["last_synced_at"])
+        latest_updated = datetime.fromisoformat(latest["updated_at"])
+
+        if latest_updated > last_synced:
+            # 有更新，更新 last_synced_at
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE user_template_subscriptions
+                    SET last_synced_at = NOW()
+                    WHERE user_id = $1 AND creator = $2
+                    """,
+                    user_id, creator
+                )
+            return latest
+
+        return None

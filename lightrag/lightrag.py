@@ -756,6 +756,8 @@ class LightRAG:
     _storages_status: StoragesStatus = field(default=StoragesStatus.NOT_CREATED)
     _prompt_storage: Optional[Any] = field(default=None, init=False, repr=False)
     """Internal prompt storage service instance."""
+    _prompt_refresh_task: Optional[Any] = field(default=None, init=False, repr=False)
+    """Background task for refreshing prompts."""
 
     @staticmethod
     def _normalize_llm_role(role: str) -> str:
@@ -1228,22 +1230,15 @@ class LightRAG:
             if self._prompt_storage:
                 try:
                     await self._prompt_storage.initialize()
-                    user_prompts = await self._prompt_storage.get_user_prompts(self.user_id)
+                    await self._reload_prompts()
 
-                    # Merge user prompts with system prompts (user prompts take precedence)
-                    from lightrag.prompt import PROMPTS
-                    merged_prompts = PROMPTS.copy()
-                    merged_prompts.update(user_prompts)
-
-                    # Update global_config with merged prompts
-                    # This ensures all operations use the user's custom prompts
-                    for key, value in merged_prompts.items():
-                        if key in PROMPTS:
-                            PROMPTS[key] = value
-
-                    logger.info(f"Loaded custom prompts for user: {self.user_id}")
+                    # Start background task for hot reload (60 seconds)
+                    self._prompt_refresh_task = asyncio.create_task(
+                        self._prompt_refresh_loop()
+                    )
+                    logger.info(f"Started prompt hot reload task for user: {self.user_id}")
                 except Exception as e:
-                    logger.warning(f"Failed to load user prompts, using system defaults: {e}")
+                    logger.warning(f"Failed to initialize prompt storage: {e}")
 
             # Set the first initialized workspace will set the default workspace
             # Allows namespace operation without specifying workspace for backward compatibility
@@ -1282,9 +1277,63 @@ class LightRAG:
             self._storages_status = StoragesStatus.INITIALIZED
             logger.debug("All storage types initialized")
 
+    async def _reload_prompts(self):
+        """重新加载用户订阅的 Prompt"""
+        if not self._prompt_storage or not self.user_id:
+            return
+
+        try:
+            user_prompts = await self._prompt_storage.get_user_prompts(self.user_id)
+            from lightrag.prompt import PROMPTS
+
+            # 合并用户 Prompt（用户配置覆盖系统默认）
+            for key, value in user_prompts.items():
+                if key in PROMPTS:
+                    PROMPTS[key] = value
+
+            logger.debug(f"Reloaded prompts for user: {self.user_id}")
+        except Exception as e:
+            logger.warning(f"Failed to reload prompts: {e}")
+
+    async def _prompt_refresh_loop(self):
+        """定时刷新 Prompt（60 秒轮询）"""
+        while True:
+            try:
+                await asyncio.sleep(60)
+
+                if not self._prompt_storage or not self.user_id:
+                    break
+
+                # 检查订阅是否有更新
+                updated = await self._prompt_storage.check_for_updates(
+                    self.user_id, self.user_id
+                )
+
+                if updated:
+                    await self._reload_prompts()
+                    logger.info(f"Hot reloaded prompts for user: {self.user_id}")
+
+            except asyncio.CancelledError:
+                logger.info("Prompt refresh task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in prompt refresh loop: {e}")
+
     async def finalize_storages(self):
         """Asynchronously finalize the storages with improved error handling"""
         if self._storages_status == StoragesStatus.INITIALIZED:
+            # Stop prompt refresh task
+            if self._prompt_refresh_task:
+                self._prompt_refresh_task.cancel()
+                try:
+                    await self._prompt_refresh_task
+                except asyncio.CancelledError:
+                    pass
+                logger.info("Stopped prompt refresh task")
+
+            # Close prompt storage
+            if self._prompt_storage:
+                await self._prompt_storage.close()
             storages = [
                 ("full_docs", self.full_docs),
                 ("text_chunks", self.text_chunks),
